@@ -6,7 +6,7 @@ from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 import pytesseract
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
+from langchain.chains import ConversationalRetrievalChain
 from langchain.docstore.document import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -83,11 +83,19 @@ def chatbot(base_vetorial):
     st.title("DígitosChatAI")
     st.write("Faça sua pergunta sobre legislação, manuais, procedimentos e convenções coletivas.")
 
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
     # Mostra a data da última atualização
     if os.path.exists("ultima_atualizacao.txt"):
         with open("ultima_atualizacao.txt", "r") as f:
             data = f.read().strip()
             st.sidebar.info(f"📅 Base atualizada em: {data}")
+
+    # Botão para limpar o histórico da conversa
+    if st.sidebar.button("🗑️ Limpar conversa"):
+        st.session_state.chat_history = []
+        st.sidebar.success("Histórico de conversa limpo!")
 
     modelo_escolhido = st.selectbox("Escolha o modelo da OpenAI:", ["gpt-3.5-turbo", "gpt-4"])
     pergunta = st.text_input("Digite sua pergunta:")
@@ -99,16 +107,21 @@ def chatbot(base_vetorial):
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
 
-        qa = RetrievalQA.from_chain_type(
+        qa = ConversationalRetrievalChain.from_llm(
             llm=modelo,
-            chain_type="stuff",
             retriever=base_vetorial.as_retriever(search_kwargs={"k": 2}),
             return_source_documents=True
         )
 
-        resposta_completa = qa({"query": pergunta})
-        resposta = resposta_completa["result"]
+        resposta_completa = qa({
+            "question": pergunta,
+            "chat_history": st.session_state.chat_history
+        })
+
+        resposta = resposta_completa["answer"]
         fontes = resposta_completa["source_documents"]
+
+        st.session_state.chat_history.append((pergunta, resposta))
 
         st.write("**Resposta:**")
         st.write(resposta)
@@ -119,12 +132,19 @@ def chatbot(base_vetorial):
             nomes_fontes = set(doc.metadata['fonte'] for doc in fontes)
             st.write("**Fonte(s):**", ", ".join(nomes_fontes))
 
+    # Mostrar histórico
+    with st.expander("🕒 Histórico da conversa"):
+        for i, (q, r) in enumerate(st.session_state.chat_history):
+            st.markdown(f"**{i+1}. Pergunta:** {q}")
+            st.markdown(f"**Resposta:** {r}")
+            st.markdown("---")
+
 # Executar
 if __name__ == "__main__":
     caminho_index = "faiss_index"
     atualizar_base = st.sidebar.button("🔄 Recarregar base de documentos")
 
-    if os.path.exists(caminho_index) and not atualizar_base:
+    if os.path.exists(os.path.join(caminho_index, "index.faiss")) and not atualizar_base:
         embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
         base = FAISS.load_local(caminho_index, embeddings, allow_dangerous_deserialization=True)
     else:
