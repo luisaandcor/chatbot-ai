@@ -30,7 +30,7 @@ QA_PROMPT = PromptTemplate.from_template(
     "Pergunta: {question}\nResposta detalhada:"
 )
 
-# Função para carregar o conteúdo de um único PDF
+# Carrega texto de um único PDF (texto ou OCR)
 def carregar_documento(caminho):
     texto = ""
     try:
@@ -47,15 +47,21 @@ def carregar_documento(caminho):
         except Exception:
             pass
     nome = os.path.basename(caminho)
-    if texto.strip():
-        return [Document(page_content=texto, metadata={"fonte": nome})]
-    return []
+    return [Document(page_content=texto, metadata={"fonte": nome})] if texto.strip() else []
 
-# Função para criar ou carregar índice FAISS localmente
+# Cria ou carrega índice FAISS, verificando ambos arquivos .faiss e .pkl
 def criar_ou_carregar_indice(docs, index_path="faiss_index"):
     embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-    if os.path.isdir(index_path) and os.path.exists(os.path.join(index_path, "index.faiss")):
-        return FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+    faiss_file = os.path.join(index_path, "index.faiss")
+    pkl_file = os.path.join(index_path, "index.pkl")
+    # Tenta carregar índice existente somente se ambos arquivos existirem
+    if os.path.isdir(index_path) and os.path.exists(faiss_file) and os.path.exists(pkl_file):
+        try:
+            return FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+        except Exception:
+            # Se falhar ao carregar, remove índice corrompido e recria abaixo
+            shutil.rmtree(index_path)
+    # Cria novo índice
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.split_documents(docs)
     base = FAISS.from_documents(chunks, embeddings)
@@ -98,18 +104,13 @@ def chatbot(base, index_path):
         resposta = res["answer"].strip()
         fontes = res.get("source_documents", [])
 
-        # Se resposta for a mensagem de desculpas, exibimos diretamente
-        if resposta.startswith("Desculpe, não encontrei essa informação"):
-            st.write("**Resposta:**")
-            st.info(resposta)
+        st.session_state.history.append((pergunta, resposta))
+        st.write("**Resposta:**")
+        st.write(resposta)
+        if fontes:
+            st.write("**Fonte:**", fontes[0].metadata.get('fonte', ''))
         else:
-            st.session_state.history.append((pergunta, resposta))
-            st.write("**Resposta:**")
-            st.write(resposta)
-            if fontes:
-                st.write("**Fonte:**", fontes[0].metadata.get('fonte', ''))
-            else:
-                st.warning("⚠️ Informação não encontrada no documento.")
+            st.warning("⚠️ Informação não encontrada no documento.")
 
     # Exibe histórico da conversa
     with st.expander("🕒 Histórico da conversa"):
