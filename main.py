@@ -1,156 +1,139 @@
 import os
+import shutil
 import streamlit as st
-import time
 from datetime import datetime
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 import pytesseract
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
 from langchain.docstore.document import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.chat_models import ChatOpenAI
 from dotenv import load_dotenv
 
+# Carrega variáveis de ambiente
 load_dotenv()
 
-# Função para carregar textos dos PDFs, com OCR quando necessário
-def carregar_documentos(pasta):
-    documentos = []
+# Templates aprimorados para respostas mais completas e amigáveis
+CONDENSE_PROMPT = PromptTemplate.from_template(
+    "Resumo do histórico de conversa: {chat_history}\n" 
+    "Reformule a seguinte pergunta de forma clara e detalhada: {question}"
+)
+QA_PROMPT = PromptTemplate.from_template(
+    "Use apenas o contexto abaixo para responder à pergunta de forma detalhada e abrangente."
+    "\nSe a informação não estiver presente no contexto, responda de forma educada:"
+    " \"Desculpe, não encontrei essa informação no documento. Posso ajudar em outra coisa?\"\n\n"
+    "Contexto:\n{context}\n\n"
+    "Pergunta: {question}\nResposta detalhada:"
+)
 
-    for root, dirs, files in os.walk(pasta):
-        for file in files:
-            if file.endswith(".pdf"):
-                caminho = os.path.join(root, file)
-                texto_pdf = ""
+# Função para carregar o conteúdo de um único PDF
+def carregar_documento(caminho):
+    texto = ""
+    try:
+        leitor = PdfReader(caminho)
+        for pagina in leitor.pages:
+            texto += pagina.extract_text() or ""
+    except Exception:
+        pass
+    if not texto.strip():
+        try:
+            imagens = convert_from_path(caminho)
+            for img in imagens:
+                texto += pytesseract.image_to_string(img, lang='eng')
+        except Exception:
+            pass
+    nome = os.path.basename(caminho)
+    if texto.strip():
+        return [Document(page_content=texto, metadata={"fonte": nome})]
+    return []
 
-                try:
-                    leitor = PdfReader(caminho)
-                    for pagina in leitor.pages:
-                        texto = pagina.extract_text()
-                        if texto:
-                            texto_pdf += texto
-                except Exception as e:
-                    print(f"Erro ao ler {file} com PyPDF2: {e}")
-
-                if not texto_pdf.strip():
-                    # Aplica OCR se não conseguiu extrair texto
-                    try:
-                        imagens = convert_from_path(caminho)
-                        for img in imagens:
-                            texto_pdf += pytesseract.image_to_string(img, lang='eng')
-                        print(f"OCR aplicado com sucesso em: {file}")
-                    except Exception as ocr_error:
-                        print(f"Erro no OCR para {file}: {ocr_error}")
-                        continue
-
-                if texto_pdf.strip():
-                    documentos.append(Document(page_content=texto_pdf, metadata={"fonte": file}))
-                else:
-                    print(f"Aviso: Nenhum conteúdo extraído do arquivo {file}.")
-
-    return documentos
-
-# Função para criar ou carregar o banco vetorial FAISS do disco
-def criar_ou_carregar_vetores(textos, caminho_index="faiss_index"):
+# Função para criar ou carregar índice FAISS localmente
+def criar_ou_carregar_indice(docs, index_path="faiss_index"):
     embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+    if os.path.isdir(index_path) and os.path.exists(os.path.join(index_path, "index.faiss")):
+        return FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_documents(docs)
+    base = FAISS.from_documents(chunks, embeddings)
+    base.save_local(index_path)
+    return base
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-        separators=["\n\n", "\n", ".", " ", ""]
-    )
-    chunks = []
-    for texto in textos:
-        partes = splitter.split_documents([texto])
-        chunks.extend(partes)
+# Interface do chatbot
+def chatbot(base, index_path):
+    st.title("🤖 DígitosChatAI")
+    if "history" not in st.session_state:
+        st.session_state.history = []
 
-    if not chunks:
-        raise ValueError("Nenhum conteúdo válido foi encontrado nos documentos.")
+    # Botão recarregar base
+    if st.sidebar.button("🔄 Recarregar base"):
+        if os.path.isdir(index_path):
+            shutil.rmtree(index_path)
+        st.experimental_rerun()
 
-    base_vetorial = FAISS.from_documents(chunks, embeddings)
-    base_vetorial.save_local(caminho_index)
-
-    # Atualiza o timestamp da última atualização
-    with open("ultima_atualizacao.txt", "w") as f:
-        f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-    return base_vetorial
-
-# Interface do chatbot com Streamlit
-def chatbot(base_vetorial):
-    st.title("DígitosChatAI")
-    st.write("Faça sua pergunta sobre legislação, manuais, procedimentos e convenções coletivas.")
-
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
-    # Mostra a data da última atualização
-    if os.path.exists("ultima_atualizacao.txt"):
-        with open("ultima_atualizacao.txt", "r") as f:
-            data = f.read().strip()
-            st.sidebar.info(f"📅 Base atualizada em: {data}")
-
-    # Botão para limpar o histórico da conversa
+    # Botão limpar histórico
     if st.sidebar.button("🗑️ Limpar conversa"):
-        st.session_state.chat_history = []
-        st.sidebar.success("Histórico de conversa limpo!")
+        st.session_state.history = []
+        st.sidebar.success("Histórico limpo!")
 
-    modelo_escolhido = st.selectbox("Escolha o modelo da OpenAI:", ["gpt-3.5-turbo", "gpt-4"])
+    modelo = ChatOpenAI(
+        temperature=0.5,
+        model=st.sidebar.selectbox("Modelo:", ["gpt-3.5-turbo", "gpt-4"]),
+        openai_api_key=os.getenv("OPENAI_API_KEY")
+    )
+
     pergunta = st.text_input("Digite sua pergunta:")
-
     if pergunta:
-        modelo = ChatOpenAI(
-            temperature=0,
-            model=modelo_escolhido,
-            openai_api_key=os.getenv("OPENAI_API_KEY")
-        )
-
-        qa = ConversationalRetrievalChain.from_llm(
+        chain = ConversationalRetrievalChain.from_llm(
             llm=modelo,
-            retriever=base_vetorial.as_retriever(search_kwargs={"k": 2}),
+            retriever=base.as_retriever(search_kwargs={"k": 3}),
+            condense_question_prompt=CONDENSE_PROMPT,
+            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
             return_source_documents=True
         )
+        res = chain({"question": pergunta, "chat_history": st.session_state.history})
+        resposta = res["answer"].strip()
+        fontes = res.get("source_documents", [])
 
-        resposta_completa = qa({
-            "question": pergunta,
-            "chat_history": st.session_state.chat_history
-        })
-
-        resposta = resposta_completa["answer"]
-        fontes = resposta_completa["source_documents"]
-
-        st.session_state.chat_history.append((pergunta, resposta))
-
-        st.write("**Resposta:**")
-        st.write(resposta)
-
-        if not fontes:
-            st.warning("\u26a0\ufe0f Não encontrei essa informação nos documentos.")
+        # Se resposta for a mensagem de desculpas, exibimos diretamente
+        if resposta.startswith("Desculpe, não encontrei essa informação"):
+            st.write("**Resposta:**")
+            st.info(resposta)
         else:
-            nomes_fontes = set(doc.metadata['fonte'] for doc in fontes)
-            st.write("**Fonte(s):**", ", ".join(nomes_fontes))
+            st.session_state.history.append((pergunta, resposta))
+            st.write("**Resposta:**")
+            st.write(resposta)
+            if fontes:
+                st.write("**Fonte:**", fontes[0].metadata.get('fonte', ''))
+            else:
+                st.warning("⚠️ Informação não encontrada no documento.")
 
-    # Mostrar histórico
+    # Exibe histórico da conversa
     with st.expander("🕒 Histórico da conversa"):
-        for i, (q, r) in enumerate(st.session_state.chat_history):
-            st.markdown(f"**{i+1}. Pergunta:** {q}")
-            st.markdown(f"**Resposta:** {r}")
+        for i, (q, a) in enumerate(st.session_state.history, 1):
+            st.markdown(f"**{i}. Pergunta:** {q}")
+            st.markdown(f"**Resposta:** {a}")
             st.markdown("---")
 
-# Executar
+# Execução principal
 if __name__ == "__main__":
-    caminho_index = "faiss_index"
-    atualizar_base = st.sidebar.button("🔄 Recarregar base de documentos")
+    pdfs = [f for f in os.listdir("documentos") if f.lower().endswith('.pdf')]
+    if not pdfs:
+        st.error("Nenhum PDF encontrado na pasta 'documentos'.")
+        st.stop()
+    if len(pdfs) > 1:
+        st.error("Mais de um PDF encontrado. Deixe apenas um arquivo em 'documentos'.")
+        st.stop()
 
-    if os.path.exists(os.path.join(caminho_index, "index.faiss")) and not atualizar_base:
-        embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-        base = FAISS.load_local(caminho_index, embeddings, allow_dangerous_deserialization=True)
-    else:
-        with st.spinner("Carregando e processando os documentos..."):
-            docs = carregar_documentos("documentos")
-            base = criar_ou_carregar_vetores(docs, caminho_index)
-            st.success("Base de documentos atualizada com sucesso!")
+    caminho = os.path.join("documentos", pdfs[0])
+    docs = carregar_documento(caminho)
+    if not docs:
+        st.error("Falha ao extrair texto do PDF.")
+        st.stop()
 
-    chatbot(base)
+    index_path = "faiss_index"
+    base = criar_ou_carregar_indice(docs, index_path)
+    chatbot(base, index_path)
